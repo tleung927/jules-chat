@@ -99,6 +99,7 @@ def extract_text_from_activity(activity):
 
     # 4. text or message (guess role based on type)
     type_str = str(activity.get("type", "")).lower()
+    # Default to Jules if type isn't clearly user, but check fallback logic carefully
     role = "User" if "user" in type_str else "Jules"
 
     if "text" in activity:
@@ -110,12 +111,15 @@ def extract_text_from_activity(activity):
         if isinstance(val, str):
             messages.append((role, val))
         elif isinstance(val, dict):
+            if "role" in val:
+                r = str(val["role"]).lower()
+                role = "User" if "user" in r else "Jules"
+
             if "content" in val:
                 messages.append((role, str(val["content"])))
             elif "text" in val:
                 messages.append((role, str(val["text"])))
             else:
-                # Just extract any string
                 pass
         if messages: return messages
 
@@ -123,7 +127,7 @@ def extract_text_from_activity(activity):
     def extract_strings(d):
         if isinstance(d, dict):
             for k, v in d.items():
-                if k.lower() in ['id', 'name', 'type', 'timestamp']: continue # skip metadata
+                if k.lower() in ['id', 'name', 'type', 'timestamp', 'role']: continue # skip metadata
                 yield from extract_strings(v)
         elif isinstance(d, list):
             for item in d:
@@ -133,7 +137,14 @@ def extract_text_from_activity(activity):
 
     strings = list(extract_strings(activity))
     if strings:
-        messages.append((role, " ".join(strings)))
+        # Before defaulting to the role derived from `type`, try to infer from the text itself
+        # since Jules prefixes messages with dates/users sometimes if it's a raw output.
+        content = " ".join(strings)
+        if content.startswith("user ") or "Z user " in content:
+            role = "User"
+        elif content.startswith("agent ") or "Z agent " in content:
+            role = "Jules"
+        messages.append((role, content))
 
     return messages
 
@@ -170,10 +181,9 @@ def fetch_activities(session_name, headers):
         if not next_page_token:
             break
 
-    # Google's Jules API returns activities newest-first in each page, but paginates backwards in time.
-    # Therefore, we fetch all pages to get the complete history (newest down to oldest overall),
-    # and then reverse the entire list to render oldest at the top and newest at the bottom.
-    return list(reversed(all_activities))
+    # The Jules API returns messages chronologically (oldest to newest) when paginating forwards.
+    # The newest message from today will be at the very end of the accumulated list.
+    return all_activities
 
 def display_chat_history(activities):
     clear_screen()
