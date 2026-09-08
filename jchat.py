@@ -152,10 +152,9 @@ def fetch_activities(session_name, headers):
     if not activities and isinstance(data, list):
         activities = data
 
-    # Activities might be newest-first. If they have a timestamp, we can sort,
-    # but typically it's better to just display them. If we notice they are backwards,
-    # we can reverse them. We'll leave as returned for now.
-    return activities
+    # Activities are returned newest-first. We reverse them so the oldest
+    # is at the top and the newest is at the bottom, just above the prompt.
+    return list(reversed(activities))
 
 def display_chat_history(activities):
     clear_screen()
@@ -180,6 +179,15 @@ def send_message(session_name, prompt, headers):
     if response.status_code != 200:
         print(f"{COLOR_SYSTEM}Failed to send message: {response.text}{COLOR_RESET}")
 
+def count_jules_messages(activities):
+    count = 0
+    for activity in activities:
+        messages = extract_text_from_activity(activity)
+        for role, _ in messages:
+            if role == "Jules":
+                count += 1
+    return count
+
 def chat_loop(session_name, headers):
     while True:
         activities = fetch_activities(session_name, headers)
@@ -187,13 +195,33 @@ def chat_loop(session_name, headers):
 
         try:
             user_input = input(f"{COLOR_USER}> {COLOR_RESET}")
+
+            # If user presses enter without typing, just refresh the history
+            if not user_input.strip():
+                continue
+
             if user_input.strip().lower() in ['exit', 'quit']:
                 print(f"{COLOR_SYSTEM}Exiting chat.{COLOR_RESET}")
                 break
 
-            if user_input.strip():
-                send_message(session_name, user_input, headers)
+            # Print the user's message immediately so it doesn't disappear
+            print(f"{COLOR_USER}User: {user_input.strip()}{COLOR_RESET}\n")
+            print(f"{COLOR_SYSTEM}Waiting for Jules to respond...{COLOR_RESET}")
+
+            send_message(session_name, user_input, headers)
+
+            # Wait for Jules' response
+            max_retries = 15 # 45 seconds total
+            original_jules_count = count_jules_messages(activities)
+
+            for _ in range(max_retries):
                 time.sleep(3)
+                new_activities = fetch_activities(session_name, headers)
+                new_jules_count = count_jules_messages(new_activities)
+                if new_jules_count > original_jules_count:
+                    # New activity from Jules found
+                    break
+
         except (KeyboardInterrupt, EOFError):
             print(f"\n{COLOR_SYSTEM}Exiting chat.{COLOR_RESET}")
             break
