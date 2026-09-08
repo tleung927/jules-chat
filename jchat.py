@@ -4,6 +4,7 @@ import sys
 import time
 import requests
 import json
+import re
 from dotenv import load_dotenv
 
 def load_api_key():
@@ -57,95 +58,129 @@ def print_sessions(sessions):
         print(f"[{idx}] {session_id} - {title}")
 
 def extract_text_from_activity(activity):
-    # Filter out system "thinking" and "update" messages per user request
+    # Filter out system "thinking" and "update" messages per user request.
     activity_type = str(activity.get("type", "")).lower()
-    if "think" in activity_type or "update" in activity_type:
+    if activity_type == "thinking" or activity_type == "update":
         return []
 
     messages = []
 
     # 1. userPrompt / agentResponse
-    if "userPrompt" in activity:
-        val = activity["userPrompt"]
-        text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
-        if text: messages.append(("User", text))
+    if not messages:
+        if "userPrompt" in activity:
+            val = activity["userPrompt"]
+            text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
+            if text: messages.append(("User", text))
 
-    if "agentResponse" in activity:
-        val = activity["agentResponse"]
-        text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
-        if text: messages.append(("Jules", text))
-
-    if messages: return messages
+        if "agentResponse" in activity:
+            val = activity["agentResponse"]
+            text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
+            if text: messages.append(("Jules", text))
 
     # 2. prompt / response
-    if "prompt" in activity:
-        val = activity["prompt"]
-        text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
-        if text: messages.append(("User", text))
+    if not messages:
+        if "prompt" in activity:
+            val = activity["prompt"]
+            text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
+            if text: messages.append(("User", text))
 
-    if "response" in activity:
-        val = activity["response"]
-        text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
-        if text: messages.append(("Jules", text))
-
-    if messages: return messages
+        if "response" in activity:
+            val = activity["response"]
+            text = val if isinstance(val, str) else val.get("text", val.get("content", ""))
+            if text: messages.append(("Jules", text))
 
     # 3. role / content or text
-    if "role" in activity:
-        role_str = str(activity["role"]).lower()
-        role = "User" if "user" in role_str else "Jules"
+    if not messages:
+        if "role" in activity:
+            role_str = str(activity["role"]).lower()
+            role = "User" if "user" in role_str else "Jules"
 
-        if "content" in activity:
-            messages.append((role, str(activity["content"])))
-            return messages
-        if "text" in activity:
-            messages.append((role, str(activity["text"])))
-            return messages
+            if "content" in activity:
+                messages.append((role, str(activity["content"])))
+            elif "text" in activity:
+                messages.append((role, str(activity["text"])))
 
     # 4. text or message (guess role based on type)
-    type_str = str(activity.get("type", "")).lower()
-    # Default to Jules if type isn't clearly user, but check fallback logic carefully
-    role = "User" if "user" in type_str else "Jules"
+    if not messages:
+        type_str = str(activity.get("type", "")).lower()
+        # Default to Jules if type isn't clearly user, but check fallback logic carefully
+        role = "User" if "user" in type_str else "Jules"
 
-    if "text" in activity:
-        messages.append((role, str(activity["text"])))
-        return messages
+        if "text" in activity:
+            messages.append((role, str(activity["text"])))
 
-    if "message" in activity:
-        val = activity["message"]
-        if isinstance(val, str):
-            messages.append((role, val))
-        elif isinstance(val, dict):
-            if "role" in val:
-                r = str(val["role"]).lower()
-                role = "User" if "user" in r else "Jules"
+        elif "message" in activity:
+            val = activity["message"]
+            if isinstance(val, str):
+                messages.append((role, val))
+            elif isinstance(val, dict):
+                if "role" in val:
+                    r = str(val["role"]).lower()
+                    role = "User" if "user" in r else "Jules"
 
-            if "content" in val:
-                messages.append((role, str(val["content"])))
-            elif "text" in val:
-                messages.append((role, str(val["text"])))
+                if "content" in val:
+                    messages.append((role, str(val["content"])))
+                elif "text" in val:
+                    messages.append((role, str(val["text"])))
+
+    # 5. Fallback: extract string values recursively to avoid raw JSON
+    if not messages:
+        def extract_strings(d):
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    if k.lower() in ['id', 'name', 'type', 'timestamp', 'role']: continue
+                    yield from extract_strings(v)
+            elif isinstance(d, list):
+                for item in d:
+                    yield from extract_strings(item)
+            elif isinstance(d, str):
+                yield d
+
+        strings = list(extract_strings(activity))
+        if strings:
+            content = " ".join(strings)
+            # Apply regex to fallback as well
+            match = re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+(user|agent)\s+(.*)', content, re.DOTALL)
+            if match:
+                found_role = "User" if match.group(1).lower() == "user" else "Jules"
+                messages.append((found_role, match.group(2).strip()))
             else:
-                pass
-        if messages: return messages
+                messages.append((role, content))
 
-    return messages
+    # Final Cleanup Pass: Check all extracted messages (from any step) for the raw timestamp format
+    # and filter out any remaining internal tool traces/scripts.
+    cleaned_messages = []
+    for r, text in messages:
+        match = re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+(user|agent)\s+(.*)', text, re.DOTALL)
+        if match:
+            r = "User" if match.group(1).lower() == "user" else "Jules"
+            text = match.group(2).strip()
+
+        # Ignore noisy diffs or internal source traces that aren't real conversational messages
+        if "diff --git" in text or "sources/github/" in text:
+            continue
+
+        cleaned_messages.append((r, text))
+
+    return cleaned_messages
 
 def fetch_activities(session_name, headers):
     if session_name.startswith("sessions/"):
-        base_url = f"{BASE_URL}/{session_name}/activities?pageSize=100"
+        base_url = f"{BASE_URL}/{session_name}/activities"
     else:
-        base_url = f"{BASE_URL}/sessions/{session_name}/activities?pageSize=100"
+        base_url = f"{BASE_URL}/sessions/{session_name}/activities"
 
     all_activities = []
     next_page_token = None
 
     while True:
-        url = base_url
+        params = {"pageSize": 100}
         if next_page_token:
-            url += f"&pageToken={next_page_token}"
+            params["pageToken"] = next_page_token
 
-        response = requests.get(url, headers=headers)
+        response = requests.get(base_url, headers=headers, params=params)
         if response.status_code != 200:
+            print(f"{COLOR_SYSTEM}Error fetching activities: {response.text}{COLOR_RESET}")
             break
 
         data = response.json()
@@ -163,9 +198,8 @@ def fetch_activities(session_name, headers):
         if not next_page_token:
             break
 
-    # The Jules API returns messages chronologically (oldest to newest) when paginating forwards.
-    # The newest message from today will be at the very end of the accumulated list.
-    return all_activities
+    # Reversing the list puts the most recent message at the bottom, right above the prompt.
+    return list(reversed(all_activities))
 
 def display_chat_history(activities):
     clear_screen()
