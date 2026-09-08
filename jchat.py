@@ -57,6 +57,11 @@ def print_sessions(sessions):
         print(f"[{idx}] {session_id} - {title}")
 
 def extract_text_from_activity(activity):
+    # Filter out system "thinking" and "update" messages per user request
+    activity_type = str(activity.get("type", "")).lower()
+    if "think" in activity_type or "update" in activity_type:
+        return []
+
     messages = []
 
     # 1. userPrompt / agentResponse
