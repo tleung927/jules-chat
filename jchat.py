@@ -139,22 +139,41 @@ def extract_text_from_activity(activity):
 
 def fetch_activities(session_name, headers):
     if session_name.startswith("sessions/"):
-        url = f"{BASE_URL}/{session_name}/activities?pageSize=30"
+        base_url = f"{BASE_URL}/{session_name}/activities?pageSize=100"
     else:
-        url = f"{BASE_URL}/sessions/{session_name}/activities?pageSize=30"
+        base_url = f"{BASE_URL}/sessions/{session_name}/activities?pageSize=100"
 
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return []
+    all_activities = []
+    next_page_token = None
 
-    data = response.json()
-    activities = data.get("activities", [])
-    if not activities and isinstance(data, list):
-        activities = data
+    while True:
+        url = base_url
+        if next_page_token:
+            url += f"&pageToken={next_page_token}"
 
-    # Activities are returned newest-first. We reverse them so the oldest
-    # is at the top and the newest is at the bottom, just above the prompt.
-    return list(reversed(activities))
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            break
+
+        data = response.json()
+
+        # If it's just a flat list for some reason
+        if isinstance(data, list):
+            all_activities.extend(data)
+            break
+
+        activities = data.get("activities", [])
+        if activities:
+            all_activities.extend(activities)
+
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    # Google's Jules API returns activities newest-first in each page, but paginates backwards in time.
+    # Therefore, we fetch all pages to get the complete history (newest down to oldest overall),
+    # and then reverse the entire list to render oldest at the top and newest at the bottom.
+    return list(reversed(all_activities))
 
 def display_chat_history(activities):
     clear_screen()
