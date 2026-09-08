@@ -128,29 +128,6 @@ def extract_text_from_activity(activity):
                 pass
         if messages: return messages
 
-    # 5. Fallback: extract string values recursively to avoid raw JSON
-    def extract_strings(d):
-        if isinstance(d, dict):
-            for k, v in d.items():
-                if k.lower() in ['id', 'name', 'type', 'timestamp', 'role']: continue # skip metadata
-                yield from extract_strings(v)
-        elif isinstance(d, list):
-            for item in d:
-                yield from extract_strings(item)
-        elif isinstance(d, str):
-            yield d
-
-    strings = list(extract_strings(activity))
-    if strings:
-        # Before defaulting to the role derived from `type`, try to infer from the text itself
-        # since Jules prefixes messages with dates/users sometimes if it's a raw output.
-        content = " ".join(strings)
-        if content.startswith("user ") or "Z user " in content:
-            role = "User"
-        elif content.startswith("agent ") or "Z agent " in content:
-            role = "Jules"
-        messages.append((role, content))
-
     return messages
 
 def fetch_activities(session_name, headers):
