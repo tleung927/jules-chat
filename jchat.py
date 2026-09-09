@@ -43,6 +43,9 @@ TERMINAL_STATES = {"COMPLETED", "FAILED"}
 # 7x margin. Keep it small: it is the worst-case stall when Jules decides a
 # message needs no reply at all, and until it expires the prompt is blocked.
 STARTUP_GRACE = 45
+# Seconds to let a newly created session become queryable before giving up and
+# opening the chat loop anyway. Measured at ~2s against the live API.
+READY_TIMEOUT = 15
 
 # Every activity payload the API can attach to an activity.
 ACTIVITY_KINDS = (
@@ -398,6 +401,38 @@ def say_markdown(text, base, indent="  "):
         say(base, wrap(md_inline(raw, base), indent))
 
 
+def can_encode(text):
+    """Whether the terminal can render these characters without mojibake."""
+    try:
+        text.encode(sys.stdout.encoding or "utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def print_banner(lines=()):
+    """The rounded welcome box drawn when the CLI starts."""
+    rounded = can_encode("\u256d\u2500\u2502")
+    title = "{} Welcome to Jules Chat".format("\u273b" if can_encode("\u273b") else "*")
+    body = [title, ""] + ["  " + line for line in lines]
+    # One space of padding either side of the widest line.
+    inner = max(display_width(line) for line in body) + 2
+    top_left, top_right, bottom_left, bottom_right, bar, wall = (
+        ("\u256d", "\u256e", "\u2570", "\u256f", "\u2500", "\u2502")
+        if rounded else ("+", "+", "+", "+", "-", "|")
+    )
+    def edge(left, right):
+        return "{}{}{}{}{}".format(COLOR_JULES, left, bar * inner, right, COLOR_RESET)
+
+    emit(edge(top_left, top_right))
+    for index, line in enumerate(body):
+        text = BOLD + line + BOLD_OFF if index == 0 else line
+        pad = " " * max(0, inner - 1 - display_width(line))
+        emit("{c}{w}{r} {t}{p}{c}{w}{r}".format(
+            c=COLOR_JULES, w=wall, r=COLOR_RESET, t=text, p=pad))
+    emit(edge(bottom_left, bottom_right))
+
+
 # True while a transient status line is on screen with the cursor parked on it.
 # Anything that prints must clear it first, or it will overwrite only part of
 # the status text and leave fragments behind mid-line.
@@ -535,6 +570,27 @@ class JulesClient:
 
     def approve_plan(self, session_name):
         self._request("POST", self._url(session_name, ":approvePlan"), json={})
+
+    def list_sources(self, page_size=100):
+        """Every repo Jules has been granted access to, with their branches."""
+        data = self._request("GET", "{}/sources".format(BASE_URL), params={"pageSize": page_size})
+        if isinstance(data, list):
+            return data
+        return data.get("sources", [])
+
+    def create_session(self, prompt, source, branch=None, title=None,
+                       require_plan_approval=True, auto_pr=False):
+        body = {"prompt": prompt, "sourceContext": {"source": source}}
+        if branch:
+            body["sourceContext"]["githubRepoContext"] = {"startingBranch": branch}
+        if title:
+            body["title"] = title
+        # Sent explicitly either way: the CLI's whole plan flow depends on
+        # knowing whether Jules will stop and ask before it starts editing.
+        body["requirePlanApproval"] = bool(require_plan_approval)
+        if auto_pr:
+            body["automationMode"] = "AUTO_CREATE_PR"
+        return self._request("POST", "{}/sessions".format(BASE_URL), json=body)
 
 
 def activity_key(activity):
@@ -852,8 +908,12 @@ their own -- you can keep typing while it works.""")
                 pass
 
     def run(self):
-        say(COLOR_SYSTEM, "--- {} ---".format(self.session_name))
-        say(COLOR_DIM, "/help for commands\n")
+        print_banner([
+            "/help for commands",
+            "cwd: {}".format(os.getcwd()),
+            "session: {}".format(self.session_name),
+        ])
+        emit("")
 
         self.sync()
         self.refresh_state(quiet=False)
@@ -979,9 +1039,202 @@ def resolve_session(selector, sessions):
     return None
 
 
+def source_label(source):
+    """owner/repo, falling back to the resource name for non-GitHub sources."""
+    repo = source.get("githubRepo") or {}
+    owner, name = repo.get("owner"), repo.get("repo")
+    if owner and name:
+        return "{}/{}".format(owner, name)
+    return source.get("name") or source.get("id") or "unknown"
+
+
+def source_branches(source):
+    """(branches, default). The default branch is always first in the list."""
+    repo = source.get("githubRepo") or {}
+    branches = [b.get("displayName") for b in repo.get("branches", []) if b.get("displayName")]
+    default = (repo.get("defaultBranch") or {}).get("displayName")
+    if default:
+        if default in branches:
+            branches.remove(default)
+        branches.insert(0, default)
+    return branches, default
+
+
+def print_sources(sources):
+    if not sources:
+        say(COLOR_SYSTEM, "No sources found. Connect a repo to Jules first.")
+        return
+    say(COLOR_SYSTEM, "Sources:")
+    for index, source in enumerate(sources, start=1):
+        _, default = source_branches(source)
+        emit("[{}] {}{:<34}{} {}".format(
+            index, COLOR_CODE, source_label(source), COLOR_RESET,
+            "({})".format(default) if default else ""))
+
+
+def choose(title, labels, default=0):
+    """Numbered picker. Returns an index, or None if the user backed out."""
+    say(COLOR_SYSTEM, title)
+    for index, label in enumerate(labels, start=1):
+        emit("  [{}] {}".format(index, label))
+    while True:
+        try:
+            raw = clean_input(input("{}Choice [{}]: {}".format(
+                COLOR_USER, default + 1, COLOR_RESET)))
+        except (KeyboardInterrupt, EOFError):
+            emit("")
+            return None
+        if not raw:
+            return default
+        try:
+            index = int(raw)
+        except ValueError:
+            index = 0
+        if 1 <= index <= len(labels):
+            return index - 1
+        say(COLOR_ERROR, "Enter a number between 1 and {}.".format(len(labels)))
+
+
+def match_source(selector, sources):
+    """Match --repo against owner/repo, a bare repo name, or a source name."""
+    wanted = selector.strip().lower()
+    hits = [s for s in sources
+            if wanted in (source_label(s).lower(),
+                          (s.get("name") or "").lower(),
+                          (s.get("id") or "").lower())]
+    if not hits:
+        hits = [s for s in sources if source_label(s).lower().split("/")[-1] == wanted]
+    if len(hits) == 1:
+        return hits[0], None
+    if not hits:
+        return None, "No source matches {!r}.".format(selector)
+    return None, "{!r} matches {} sources; use owner/repo.".format(selector, len(hits))
+
+
+def start_new_session(client, args):
+    """Create a session, then hand it to the interactive chat loop."""
+    print_banner(["new session", "cwd: {}".format(os.getcwd())])
+    emit("")
+
+    try:
+        sources = client.list_sources()
+    except JulesError as exc:
+        say(COLOR_ERROR, "Failed to fetch sources: {}".format(exc))
+        return 1
+    if not sources:
+        say(COLOR_ERROR, "No sources available. Connect a repo to Jules first.")
+        return 1
+
+    if args.repo:
+        source, problem = match_source(args.repo, sources)
+        if problem:
+            say(COLOR_ERROR, problem)
+            print_sources(sources)
+            return 1
+    elif not _interactive:
+        say(COLOR_ERROR, "--repo is required when not running on a terminal.")
+        print_sources(sources)
+        return 1
+    else:
+        labels = []
+        for candidate in sources:
+            _, default = source_branches(candidate)
+            labels.append("{}{}".format(
+                source_label(candidate), "  ({})".format(default) if default else ""))
+        picked = choose("Which repo?", labels)
+        if picked is None:
+            say(COLOR_SYSTEM, "Cancelled.")
+            return 1
+        source = sources[picked]
+
+    branches, default_branch = source_branches(source)
+    branch = args.branch or default_branch
+    if not args.branch and _interactive and len(branches) > 1:
+        picked = choose("Which branch?", branches)
+        if picked is None:
+            say(COLOR_SYSTEM, "Cancelled.")
+            return 1
+        branch = branches[picked]
+
+    prompt = (args.new or "").strip()
+    if not prompt:
+        if not _interactive:
+            say(COLOR_ERROR, "Give the task as: jchat -n \"what Jules should do\"")
+            return 1
+        say(COLOR_SYSTEM, "What should Jules do? (empty to cancel)")
+        try:
+            prompt = clean_input(input("{}> {}".format(COLOR_USER, COLOR_RESET)))
+        except (KeyboardInterrupt, EOFError):
+            prompt = ""
+        if not prompt:
+            emit("")
+            say(COLOR_SYSTEM, "Cancelled.")
+            return 1
+
+    title = args.title or prompt.splitlines()[0][:60]
+    say(COLOR_DIM, "  creating session on {} @ {} ...".format(
+        source_label(source), branch or "default branch"))
+    try:
+        session = client.create_session(
+            prompt,
+            source.get("name") or "sources/{}".format(source.get("id")),
+            branch=branch,
+            title=title,
+            require_plan_approval=not args.no_plan_approval,
+            auto_pr=args.auto_pr,
+        )
+    except JulesError as exc:
+        say(COLOR_ERROR, "Failed to create session: {}".format(exc))
+        return 1
+
+    if not (session.get("name") or session.get("id")):
+        say(COLOR_ERROR, "Session created but the API returned no name: {}".format(session))
+        return 1
+    session_name = session.get("name") or "sessions/{}".format(session["id"])
+    say(COLOR_SYSTEM, "Created {}".format(session_name))
+    if session.get("url"):
+        say(COLOR_DIM, "  {}".format(session["url"]))
+    emit("")
+
+    # A just-created session is not queryable straight away: for a second or two
+    # its activities subresource 404s. Wait that out, or the chat loop opens
+    # with a "not found" error for a session that is in fact fine.
+    for attempt in range(READY_TIMEOUT):
+        try:
+            client.list_activities(session_name)
+            break
+        except JulesError:
+            if attempt == 0:
+                say(COLOR_DIM, "  waiting for the session to come up ...")
+            time.sleep(1)
+
+    chat = ChatSession(client, session_name)
+    # The session was created moments ago and still reports its pre-work state;
+    # STARTUP_GRACE covers that the same way it covers a freshly sent message.
+    chat.sent_at = time.time()
+    chat.run()
+    return 0
+
+
 def main():
     setup_console()
-    parser = argparse.ArgumentParser(description="Jules CLI Chat")
+    parser = argparse.ArgumentParser(
+        description="Jules CLI Chat",
+        epilog='examples:\n'
+               '  jchat -n "add unit tests for the auth module"   start a new session\n'
+               '  jchat -n "fix the flaky test" --repo me/app --branch dev\n'
+               '  jchat -l                                        list recent sessions\n'
+               '  jchat -r 2                                      resume session #2',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-n",
+        "--new",
+        nargs="?",
+        const="",
+        metavar="PROMPT",
+        help="Start a new session with this task; omit the value to be asked for it",
+    )
     parser.add_argument(
         "-r",
         "--resume",
@@ -990,13 +1243,36 @@ def main():
         help="Resume a session by list index or session id; omit the value to list sessions",
     )
     parser.add_argument("-l", "--list", action="store_true", help="List recent sessions and exit")
+    parser.add_argument("-S", "--sources", action="store_true",
+                        help="List the repos Jules can work on and exit")
+    parser.add_argument("--repo", metavar="OWNER/REPO",
+                        help="Repo for --new; skips the picker")
+    parser.add_argument("--branch", metavar="NAME",
+                        help="Starting branch for --new (default: the repo's default branch)")
+    parser.add_argument("--title", help="Session title for --new (default: the first line of the task)")
+    parser.add_argument("--auto-pr", action="store_true",
+                        help="Let Jules open a pull request when the change is ready")
+    parser.add_argument("--no-plan-approval", action="store_true",
+                        help="Let Jules start work without waiting for you to approve its plan")
     args = parser.parse_args()
 
-    if not args.resume and not args.list:
+    if args.new is None and not args.resume and not args.list and not args.sources:
         parser.print_help()
         return
 
     client = JulesClient(get_headers(load_api_key()))
+
+    if args.sources:
+        try:
+            print_sources(client.list_sources())
+        except JulesError as exc:
+            say(COLOR_ERROR, "Failed to fetch sources: {}".format(exc))
+            sys.exit(1)
+        return
+
+    if args.new is not None:
+        sys.exit(start_new_session(client, args))
+
     try:
         sessions = client.list_sessions()
     except JulesError as exc:
