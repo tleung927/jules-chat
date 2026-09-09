@@ -1,4 +1,5 @@
 import argparse
+import io
 import os
 import sys
 import time
@@ -173,6 +174,17 @@ def strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
+def bracket_ansi(text):
+    """Fence escapes in \001/\002 so readline treats them as zero-width.
+
+    readline counts every byte of an unfenced escape as a printable column, so
+    its idea of the cursor position drifts by the length of the colour codes.
+    Recalling history with the arrow keys or editing a long line then paints
+    over the prompt and the lines above it.
+    """
+    return ANSI_RE.sub(lambda match: "\001" + match.group(0) + "\002", text)
+
+
 def display_width(text):
     """Columns the text occupies. CJK and emoji take two, escapes take none."""
     width = 0
@@ -304,6 +316,7 @@ _can_redraw = False    # ...and readline can hand us the half-typed line
 _at_prompt = False
 _prompt_text = ""
 _pending = []
+_capture = threading.local()
 
 
 def _line_buffer():
@@ -317,6 +330,11 @@ def _line_buffer():
 
 def emit(text):
     """Print without disturbing whatever the user is typing."""
+    sink = getattr(_capture, "sink", None)
+    if sink is not None:
+        # This thread is rendering to a buffer rather than the screen.
+        sink.append(text)
+        return
     with _out_lock:
         clear_status()
         if _at_prompt and not _can_redraw:
@@ -823,6 +841,8 @@ class ChatSession:
   /plan          re-print the most recent plan
   /diff          print the most recent change set patch
   /state         show session state and web URL
+  /save [FILE]   write the whole transcript to a file (for terminals that
+                 cannot scroll back); defaults to jules-<id>-<time>.txt
   /wait, /w      block until Jules stops working (replies stream in anyway)
   /refresh, /r   fetch and print anything new right now
   /verbose, /v   toggle full progress details, bash output and diffs
@@ -862,6 +882,58 @@ their own -- you can keep typing while it works.""")
             return
         emit(patch)
 
+    def save_transcript(self, path=None):
+        """Write the whole conversation to a file.
+
+        Terminals without usable scrollback (tmux with the mouse off, say)
+        cannot page back through a long session, so offer the transcript as a
+        file instead. Rendering goes through the normal renderer and is then
+        stripped of colour, so the file matches what was on screen -- verbose
+        included, if it is on.
+        """
+        with self.api_lock:
+            try:
+                activities = self.client.list_activities(self.session_name)
+            except JulesError as exc:
+                say(COLOR_ERROR, "Could not fetch the transcript: {}".format(exc))
+                return
+
+            if not path:
+                path = "jules-{}-{}.txt".format(
+                    self.session_name.rsplit("/", 1)[-1],
+                    datetime.now().strftime("%Y%m%d-%H%M%S"))
+            path = os.path.expanduser(path)
+
+            lines = []
+            _capture.sink = lines
+            try:
+                for activity in activities:
+                    self.render(activity)
+            finally:
+                _capture.sink = None
+
+        header = [
+            "Jules session {}".format(self.session_name),
+            "State:  {}".format(self.state),
+        ]
+        if self.url:
+            header.append("URL:    {}".format(self.url))
+        header += [
+            "Saved:  {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "Activities: {}".format(len(activities)),
+            "-" * 70,
+            "",
+        ]
+        try:
+            with io.open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(header + [strip_ansi(line) for line in lines]))
+                handle.write("\n")
+        except OSError as exc:
+            say(COLOR_ERROR, "Could not write {}: {}".format(path, exc))
+            return
+        say(COLOR_SYSTEM, "Saved {} activities to {}".format(
+            len(activities), os.path.abspath(path)))
+
     def show_state(self):
         state = self.refresh_state(quiet=False)
         say(COLOR_SYSTEM, "State: {}".format(state))
@@ -872,7 +944,7 @@ their own -- you can keep typing while it works.""")
 
     def prompt_label(self):
         if self.state == "AWAITING_PLAN_APPROVAL":
-            return "{}[plan awaiting approval - /approve or y]{}\n{}> {}".format(
+            return "{}[plan awaiting approval - /approve or y]{} {}> {}".format(
                 COLOR_PLAN, COLOR_RESET, COLOR_USER, COLOR_RESET
             )
         if self.state in TERMINAL_STATES:
@@ -936,7 +1008,7 @@ their own -- you can keep typing while it works.""")
             label = self.prompt_label()
             set_prompt(label, True)
             try:
-                raw = input(label)
+                raw = input(bracket_ansi(label))
             except (KeyboardInterrupt, EOFError):
                 set_prompt("", False)
                 say(COLOR_SYSTEM, "\nLeaving chat. The Jules session keeps running.")
@@ -959,7 +1031,14 @@ their own -- you can keep typing while it works.""")
                 self.show_help()
                 continue
             if lowered == "/clear":
-                os.system("cls" if os.name == "nt" else "clear")
+                # Not the clear(1) binary: with a modern terminfo it emits
+                # \033[3J, which drops the scrollback buffer as well as the
+                # screen, taking the whole transcript with it.
+                if os.name == "nt":
+                    os.system("cls")
+                else:
+                    sys.stdout.write("\033[H\033[2J")
+                    sys.stdout.flush()
                 continue
             if lowered in ("/verbose", "/v"):
                 self.verbose = not self.verbose
@@ -975,6 +1054,11 @@ their own -- you can keep typing while it works.""")
                 continue
             if lowered in ("/state", "/status"):
                 self.show_state()
+                continue
+            if lowered == "/save" or lowered.startswith("/save "):
+                # From text, not lowered: a path must keep its capitalisation.
+                argument = text[len("/save"):].strip()
+                self.save_transcript(argument or None)
                 continue
             if lowered == "/plan":
                 self.show_plan()
