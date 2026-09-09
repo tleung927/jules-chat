@@ -6,6 +6,7 @@ import contextlib
 import json
 import re
 import shutil
+import threading
 import unicodedata
 from datetime import datetime, timezone
 
@@ -81,10 +82,21 @@ def setup_console():
     # Importing readline is what gives input() arrow-key editing and history on
     # POSIX. Without it an arrow key is delivered raw, as "\033[A" inside the
     # line. Not available on Windows, whose console does its own line editing.
+    have_readline = True
     try:
         import readline  # noqa: F401
     except Exception:
-        pass
+        have_readline = False
+
+    global _interactive, _can_redraw
+    try:
+        _interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        _interactive = False
+    # Redrawing the prompt underneath streamed output needs readline to tell us
+    # what has been typed so far. Windows input() keeps that to itself, so there
+    # we queue output rather than scribble over the input line.
+    _can_redraw = _interactive and have_readline and os.name != "nt"
 
 
 def flush_input():
@@ -267,14 +279,80 @@ def md_inline(text, base=""):
     return re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], text)
 
 
+# ---------------------------------------------------------------------------
+# Output layer.
+#
+# A background thread streams Jules' activity while the main thread sits in
+# input(). Printing from the poller straight to stdout would land in the middle
+# of whatever the user is typing, so every write goes through emit(), which
+# erases the input line, prints, and puts the prompt and the half-typed text
+# back underneath.
+#
+# We deliberately keep input() rather than reading keystrokes ourselves: it is
+# what makes IME and multi-byte (e.g. Chinese) input work. The cost is that only
+# readline can tell us the half-typed text, so the redraw is POSIX-only. Where
+# it is unavailable, output is queued until the user presses Enter instead --
+# delayed, but never corrupted.
+# ---------------------------------------------------------------------------
+
+_out_lock = threading.RLock()
+_interactive = False   # stdin and stdout are both a terminal
+_can_redraw = False    # ...and readline can hand us the half-typed line
+_at_prompt = False
+_prompt_text = ""
+_pending = []
+
+
+def _line_buffer():
+    try:
+        import readline
+
+        return readline.get_line_buffer()
+    except Exception:
+        return ""
+
+
+def emit(text):
+    """Print without disturbing whatever the user is typing."""
+    with _out_lock:
+        clear_status()
+        if _at_prompt and not _can_redraw:
+            # Cannot restore the input line, so hold it back rather than
+            # scribble over what is being typed.
+            _pending.append(text)
+            return
+        if _at_prompt:
+            sys.stdout.write("\r\033[K")
+        print(text)
+        if _at_prompt:
+            sys.stdout.write(_prompt_text + _line_buffer())
+            sys.stdout.flush()
+
+
+def set_prompt(text, active):
+    """Mark the input line as on screen (and what it looks like)."""
+    global _at_prompt, _prompt_text
+    with _out_lock:
+        _prompt_text = text
+        _at_prompt = bool(active and _interactive)
+        if not _at_prompt:
+            _drain_pending()
+
+
+def _drain_pending():
+    global _pending
+    with _out_lock:
+        held, _pending = _pending, []
+        for text in held:
+            print(text)
+
+
 def say(color, text):
-    clear_status()
-    print("{}{}{}".format(color, text, COLOR_RESET))
+    emit("{}{}{}".format(color, text, COLOR_RESET))
 
 
 def say_markdown(text, base, indent="  "):
     """Render a markdown block the way the Jules web UI shows it."""
-    clear_status()
     in_fence = False
     for raw in str(text).replace("\r\n", "\n").split("\n"):
         fence = re.match(r"\s*```(.*)$", raw)
@@ -287,7 +365,7 @@ def say_markdown(text, base, indent="  "):
             say(COLOR_CODE, indent + "  " + raw)
             continue
         if not raw.strip():
-            print()
+            emit("")
             continue
         if re.match(r"\s*([-*_])(\s*\1){2,}\s*$", raw):
             say(COLOR_DIM, indent + "-" * max(0, term_width() - display_width(indent)))
@@ -498,6 +576,11 @@ class ChatSession:
         self.last_change_set = None
         self.state = "UNKNOWN"
         self.url = ""
+        self.stop = threading.Event()
+        # One API conversation at a time: the poller thread and the prompt
+        # thread both sync, and self.seen must not be raced.
+        self.api_lock = threading.RLock()
+        self.sent_at = 0.0
 
     # ---------- rendering ----------
 
@@ -508,11 +591,11 @@ class ChatSession:
         if kind == "userMessaged":
             say(COLOR_USER, "You:")
             say_markdown(payload.get("userMessage", ""), COLOR_USER)
-            print()
+            emit("")
         elif kind == "agentMessaged":
             say(COLOR_JULES, "Jules:")
             say_markdown(payload.get("agentMessage", ""), COLOR_JULES)
-            print()
+            emit("")
         elif kind == "planGenerated":
             self.render_plan(payload.get("plan", {}))
         elif kind == "planApproved":
@@ -567,7 +650,7 @@ class ChatSession:
             if description:
                 say_markdown(description, COLOR_DIM, indent=" " * display_width(first))
         say(COLOR_PLAN, "-" * width)
-        print()
+        emit("")
 
     def render_artifact(self, artifact):
         if "changeSet" in artifact:
@@ -585,7 +668,7 @@ class ChatSession:
                     say(COLOR_DIM, patch)
                 else:
                     say(COLOR_DIM, "  (/diff to view the patch)")
-            print()
+            emit("")
         elif "bashOutput" in artifact:
             bash = artifact["bashOutput"]
             say(COLOR_DIM, "  $ {}".format(bash.get("command", "")))
@@ -609,26 +692,29 @@ class ChatSession:
 
     def sync(self, quiet=False):
         """Print every activity not printed yet. Returns the new ones."""
-        try:
-            activities = self.client.list_activities(self.session_name)
-        except JulesError as exc:
-            if not quiet:
-                say(COLOR_ERROR, "Could not fetch activities: {}".format(exc))
-            return []
+        with self.api_lock:
+            try:
+                activities = self.client.list_activities(self.session_name)
+            except JulesError as exc:
+                if not quiet:
+                    say(COLOR_ERROR, "Could not fetch activities: {}".format(exc))
+                return []
 
-        fresh = []
-        for activity in sort_activities(activities):
-            key = activity_key(activity)
-            if key in self.seen:
-                continue
-            self.seen.add(key)
-            if not fresh:
-                clear_status()
-            self.render(activity)
-            fresh.append(activity)
-        return fresh
+            fresh = []
+            for activity in sort_activities(activities):
+                key = activity_key(activity)
+                if key in self.seen:
+                    continue
+                self.seen.add(key)
+                self.render(activity)
+                fresh.append(activity)
+            return fresh
 
     def refresh_state(self, quiet=True):
+        with self.api_lock:
+            return self._refresh_state(quiet)
+
+    def _refresh_state(self, quiet=True):
         try:
             session = self.client.get_session(self.session_name)
         except JulesError as exc:
@@ -639,67 +725,38 @@ class ChatSession:
         self.url = session.get("url", "")
         return self.state
 
-    def follow(self, timeout=900, interval=3, startup_grace=0):
-        """Stream new activities until the agent stops working or we time out.
+    def wait_for_idle(self, timeout=900, interval=2):
+        """Block until Jules stops working.
 
-        `startup_grace` is the window, in seconds, during which an idle state
-        does NOT end the wait. Straight after sendMessage the API still reports
-        the state from before the message landed, so without this the very
-        first poll looks like "Jules is done" and we would hand back the prompt
-        before Jules had even started. The grace ends early -- as soon as Jules
-        demonstrably picks the message up -- so a fast reply is not delayed.
+        Only watches state; the poller thread is what prints. Useful when you
+        would rather not type over streaming output.
         """
         spinner = "|/-\\"
         started = time.time()
-        deadline = started + timeout
         tick = 0
         idle_polls = 0
-        picked_up = False
-
         try:
-          with muted_input():
-            while time.time() < deadline:
-                fresh = self.sync(quiet=True)
-                state = self.refresh_state()
-
-                if state in BUSY_STATES or any(a.get("originator") == "agent" for a in fresh):
-                    picked_up = True
-                # Any sign of life resets the idle count.
-                idle_polls = 0 if (state in BUSY_STATES or fresh) else idle_polls + 1
-
-                starting = not picked_up and (time.time() - started) < startup_grace
-                # Two consecutive quiet polls let the API flush trailing activities.
-                if idle_polls >= 2 and not starting:
-                    # One last look: anything that landed during this interval
-                    # should print above the prompt, not after it.
-                    self.sync(quiet=True)
-                    clear_status()
-                    if state == "AWAITING_PLAN_APPROVAL":
-                        self.approval_banner()
-                    elif not picked_up and startup_grace:
-                        # We waited out the grace and Jules never stirred.
-                        say(COLOR_SYSTEM,
-                            "(no reply from Jules yet - /wait to keep following)")
-                    return state
-
-                label = (
-                    "waiting for jules to pick this up"
-                    if starting
-                    else state.replace("_", " ").lower()
-                )
-                status(" {} {}  (ctrl-c to stop waiting) ".format(
-                    spinner[tick % len(spinner)], label
-                ))
-                tick += 1
-                time.sleep(interval)
+            with muted_input():
+                while time.time() - started < timeout:
+                    state = self.state
+                    # Straight after sending, the state still predates the
+                    # message; see STARTUP_GRACE.
+                    starting = (time.time() - self.sent_at) < STARTUP_GRACE
+                    idle_polls = 0 if state in BUSY_STATES else idle_polls + 1
+                    if idle_polls >= 2 and not starting:
+                        clear_status()
+                        return state
+                    label = "waiting for jules" if starting else state.replace("_", " ").lower()
+                    status(" {} {}  (ctrl-c to stop waiting) ".format(
+                        spinner[tick % len(spinner)], label))
+                    tick += 1
+                    time.sleep(interval)
         except KeyboardInterrupt:
-            # Ctrl-C should drop back to the prompt, not kill the session or the CLI.
             clear_status()
-            say(COLOR_SYSTEM, "(stopped waiting - Jules keeps working; /wait to follow again)")
+            say(COLOR_SYSTEM, "(stopped waiting - Jules keeps working)")
             return self.state
-
         clear_status()
-        say(COLOR_SYSTEM, "(gave up waiting after {}s - use /wait to keep following)".format(timeout))
+        say(COLOR_SYSTEM, "(gave up waiting after {}s)".format(timeout))
         return self.state
 
     # ---------- commands ----------
@@ -710,13 +767,14 @@ class ChatSession:
   /plan          re-print the most recent plan
   /diff          print the most recent change set patch
   /state         show session state and web URL
-  /wait, /w      keep following the session until Jules stops working
-  /refresh, /r   fetch and print anything new
+  /wait, /w      block until Jules stops working (replies stream in anyway)
+  /refresh, /r   fetch and print anything new right now
   /verbose, /v   toggle full progress details, bash output and diffs
   /clear         clear the screen
   /help, /?      show this help
   /exit, /quit   leave (the Jules session keeps running)
-Anything else is sent to Jules as a message.""")
+Anything else is sent to Jules as a message. Jules' replies stream in on
+their own -- you can keep typing while it works.""")
 
     def approval_banner(self):
         """The CLI equivalent of the web UI's "Approve plan?" button."""
@@ -733,7 +791,7 @@ Anything else is sent to Jules as a message.""")
             say(COLOR_ERROR, "Approve failed: {}".format(exc))
             return
         say(COLOR_SYSTEM, "Plan approved.")
-        self.follow(startup_grace=STARTUP_GRACE)
+        self.sent_at = time.time()
 
     def show_plan(self):
         if not self.last_plan:
@@ -746,8 +804,7 @@ Anything else is sent to Jules as a message.""")
         if not patch:
             say(COLOR_SYSTEM, "No change set has been produced in this session yet.")
             return
-        clear_status()
-        print(patch)
+        emit(patch)
 
     def show_state(self):
         state = self.refresh_state(quiet=False)
@@ -768,25 +825,64 @@ Anything else is sent to Jules as a message.""")
             )
         return "{}> {}".format(COLOR_USER, COLOR_RESET)
 
+    def poll_once(self):
+        """One poll cycle: stream anything new, then announce state changes."""
+        previous = self.state
+        self.sync(quiet=True)
+        state = self.refresh_state()
+        if state == previous:
+            return state
+
+        if state == "AWAITING_PLAN_APPROVAL":
+            self.approval_banner()
+        elif state == "FAILED":
+            say(COLOR_ERROR, "[session failed]")
+        elif previous in BUSY_STATES and state not in BUSY_STATES:
+            say(COLOR_DIM, "  (jules is idle)")
+        elif state in BUSY_STATES and previous not in BUSY_STATES:
+            say(COLOR_DIM, "  (jules is working)")
+        return state
+
+    def poll_loop(self, interval=3):
+        """Background streaming. Errors must never take the prompt down."""
+        while not self.stop.wait(interval):
+            try:
+                self.poll_once()
+            except Exception:
+                pass
+
     def run(self):
         say(COLOR_SYSTEM, "--- {} ---".format(self.session_name))
         say(COLOR_DIM, "/help for commands\n")
 
         self.sync()
-        if self.refresh_state(quiet=False) in BUSY_STATES:
-            self.follow()
-        elif self.state == "AWAITING_PLAN_APPROVAL":
+        self.refresh_state(quiet=False)
+        if self.state == "AWAITING_PLAN_APPROVAL":
             self.approval_banner()
 
+        poller = threading.Thread(target=self.poll_loop, daemon=True)
+        poller.start()
+        try:
+            self.prompt_loop()
+        finally:
+            self.stop.set()
+            poller.join(timeout=5)
+
+    def prompt_loop(self):
         while True:
             # Discard anything typed while we were polling; it was not aimed at
             # this prompt and would otherwise be sent to Jules verbatim.
             flush_input()
+            label = self.prompt_label()
+            set_prompt(label, True)
             try:
-                raw = input(self.prompt_label())
+                raw = input(label)
             except (KeyboardInterrupt, EOFError):
+                set_prompt("", False)
                 say(COLOR_SYSTEM, "\nLeaving chat. The Jules session keeps running.")
                 return
+            finally:
+                set_prompt("", False)
 
             text = clean_input(raw)
             if not text:
@@ -815,7 +911,7 @@ Anything else is sent to Jules as a message.""")
                 self.refresh_state()
                 continue
             if lowered in ("/wait", "/w"):
-                self.follow()
+                self.wait_for_idle()
                 continue
             if lowered in ("/state", "/status"):
                 self.show_state()
@@ -841,8 +937,10 @@ Anything else is sent to Jules as a message.""")
             except JulesError as exc:
                 say(COLOR_ERROR, "Failed to send message: {}".format(exc))
                 continue
-            print()
-            self.follow(startup_grace=STARTUP_GRACE)
+            # No blocking wait: the poller streams the answer in above the
+            # prompt, so the next message can be typed straight away.
+            self.sent_at = time.time()
+            say(COLOR_DIM, "  (sent)")
 
 
 def print_sessions(sessions):
