@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import time
+import contextlib
 import json
 import re
 import shutil
@@ -267,11 +268,13 @@ def md_inline(text, base=""):
 
 
 def say(color, text):
+    clear_status()
     print("{}{}{}".format(color, text, COLOR_RESET))
 
 
 def say_markdown(text, base, indent="  "):
     """Render a markdown block the way the Jules web UI shows it."""
+    clear_status()
     in_fence = False
     for raw in str(text).replace("\r\n", "\n").split("\n"):
         fence = re.match(r"\s*```(.*)$", raw)
@@ -317,15 +320,73 @@ def say_markdown(text, base, indent="  "):
         say(base, wrap(md_inline(raw, base), indent))
 
 
+# True while a transient status line is on screen with the cursor parked on it.
+# Anything that prints must clear it first, or it will overwrite only part of
+# the status text and leave fragments behind mid-line.
+_status_shown = False
+
+
 def status(text):
     """Write a transient one-line status that the next status() overwrites."""
+    global _status_shown
+    # Keep it inside one terminal row; a wrapped status cannot be erased by \r.
+    room = term_width() - 1
+    if display_width(text) > room:
+        text = text[:room]
     sys.stdout.write("\r{}{}{}\033[K".format(COLOR_DIM, text, COLOR_RESET))
     sys.stdout.flush()
+    _status_shown = True
 
 
 def clear_status():
+    global _status_shown
+    if not _status_shown:
+        return
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
+    _status_shown = False
+
+
+@contextlib.contextmanager
+def muted_input():
+    """Stop the terminal echoing keystrokes typed while we are polling.
+
+    Without this, anything typed during a wait is echoed wherever the cursor
+    happens to be, splicing the user's words into the middle of Jules' output.
+    The keystrokes are discarded by flush_input() before the next prompt.
+    """
+    restore = None
+    try:
+        if sys.stdin.isatty():
+            if os.name == "nt":
+                import ctypes
+
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+                mode = ctypes.c_ulong()
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    saved = mode.value
+                    kernel32.SetConsoleMode(handle, saved & ~0x0004)  # ENABLE_ECHO_INPUT
+                    restore = lambda: kernel32.SetConsoleMode(handle, saved)
+            else:
+                import termios
+
+                fd = sys.stdin.fileno()
+                saved = termios.tcgetattr(fd)
+                muted = termios.tcgetattr(fd)
+                muted[3] &= ~termios.ECHO  # lflags
+                termios.tcsetattr(fd, termios.TCSADRAIN, muted)
+                restore = lambda: termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    except Exception:
+        restore = None
+    try:
+        yield
+    finally:
+        if restore:
+            try:
+                restore()
+            except Exception:
+                pass
 
 
 class JulesError(Exception):
@@ -596,6 +657,7 @@ class ChatSession:
         picked_up = False
 
         try:
+          with muted_input():
             while time.time() < deadline:
                 fresh = self.sync(quiet=True)
                 state = self.refresh_state()
@@ -608,6 +670,9 @@ class ChatSession:
                 starting = not picked_up and (time.time() - started) < startup_grace
                 # Two consecutive quiet polls let the API flush trailing activities.
                 if idle_polls >= 2 and not starting:
+                    # One last look: anything that landed during this interval
+                    # should print above the prompt, not after it.
+                    self.sync(quiet=True)
                     clear_status()
                     if state == "AWAITING_PLAN_APPROVAL":
                         self.approval_banner()
@@ -681,6 +746,7 @@ Anything else is sent to Jules as a message.""")
         if not patch:
             say(COLOR_SYSTEM, "No change set has been produced in this session yet.")
             return
+        clear_status()
         print(patch)
 
     def show_state(self):
